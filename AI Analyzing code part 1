@@ -1,0 +1,598 @@
+"""
+커리어 분석 AI - Professional Edition
+--------------------------------------
+변경사항:
+  - google-generativeai → google-genai (신규 공식 SDK)
+  - 임베딩 모델: gemini-embedding-001 (2026년 최신)
+  - 채용공고 날짜 필터: 사용자가 입력한 마감일 기준으로 유효 공고만 표시
+  - URL 크롤링: SPA 감지 + PDF 자동 추출 유지
+"""
+
+import json
+import re
+import os
+import io
+import urllib.request
+import urllib.parse
+from html.parser import HTMLParser
+from datetime import datetime, date
+
+# ✅ 신규 공식 SDK
+from google import genai
+from google.genai import types
+
+import pypdf
+
+# ──────────────────────────────────────────────
+# 설정
+# ──────────────────────────────────────────────
+GEMINI_API_KEY = "AIzaSyDL3Md4U3rctgjwuASn3mCUFCijLZWGpV0"
+
+# ✅ 새 SDK: configure() 대신 Client() 사용
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+_ANALYSIS_MODEL  = "gemini-2.5-flash"
+_EMBEDDING_MODEL = "gemini-embedding-001"   # ✅ 2026년 기준 최신 임베딩 모델
+
+
+# ──────────────────────────────────────────────
+# 날짜 입력 유틸
+# ──────────────────────────────────────────────
+def get_reference_date() -> date:
+    """
+    사용자가 기준일을 입력하면 그 날짜를 반환합니다.
+    엔터를 누르면 오늘 날짜를 사용합니다.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"\n[채용공고 마감일 기준]")
+    print(f"  입력한 날짜 이후에 마감되는 공고만 유효한 공고로 표시합니다.")
+    raw = input(f"  기준 날짜 입력 (YYYY-MM-DD, 기본값: 오늘 {today_str}): ").strip()
+
+    if not raw:
+        ref = date.today()
+        print(f"  → 오늘({today_str}) 기준으로 검색합니다.")
+        return ref
+
+    try:
+        ref = datetime.strptime(raw, "%Y-%m-%d").date()
+        print(f"  → {ref.strftime('%Y-%m-%d')} 기준으로 검색합니다.")
+        return ref
+    except ValueError:
+        print("  ⚠ 날짜 형식이 잘못되었습니다. 오늘 날짜로 대체합니다.")
+        return date.today()
+
+
+# ──────────────────────────────────────────────
+# 시스템 프롬프트 (기준일 동적 주입)
+# ──────────────────────────────────────────────
+def build_system_prompt(ref_date: date) -> str:
+    return f"""
+당신은 대한민국 최고의 전문 커리어 컨설턴트이자 데이터 분석가입니다.
+분석 기준일: {ref_date.strftime('%Y-%m-%d')}
+
+[분석 원칙]
+1. 근거 중심: 제공된 텍스트에 명시된 사실에만 기반하여 분석하십시오.
+2. 환각 방지: 데이터가 부족하면 'status'를 'insufficient_data'로 설정하십시오.
+3. STAR 방식: 이력서 초안은 STAR 프레임워크를 따르십시오.
+4. 채용공고 유효성: 반드시 마감일이 {ref_date.strftime('%Y-%m-%d')} 이후인 공고만 추천하십시오.
+   - 마감일을 확인할 수 없는 공고는 추천하지 마십시오.
+   - 각 공고의 마감일(deadline)을 반드시 응답에 포함하십시오.
+   - Google Search를 사용해 실시간으로 공고를 검색하십시오.
+
+[출력 형식 - 중요]
+응답은 반드시 마크다운(```json)이나 다른 부연 설명 없이 오직 순수한 JSON 중괄호 {{}} 로만 시작하고 끝나야 합니다.
+
+[출력 데이터 구조]
+{{
+    "status": "success" | "insufficient_data",
+    "brief_summary": "핵심 한 줄 요약",
+    "detailed_summary": "심층 요약",
+    "keyword_clustering": {{
+        "personality_tendency": ["성향 키워드"],
+        "core_competency": ["역량 키워드"],
+        "job_industry": ["직군 분류"]
+    }},
+    "experience_insights": {{
+        "motivation": "동기 분석",
+        "learning_points": "배움 및 성장 포인트"
+    }},
+    "resume_star_format": [
+        {{
+            "title": "경험 명칭",
+            "S": "상황",
+            "T": "과제",
+            "A": "행동",
+            "R": "결과"
+        }}
+    ],
+    "valid_job_recommendations": [
+        {{
+            "company": "회사명",
+            "role": "채용 직무",
+            "deadline": "마감일 (YYYY-MM-DD 또는 '상시채용')",
+            "is_valid": true,
+            "why_match": "매칭 근거",
+            "url": "채용공고 URL"
+        }}
+    ],
+    "missing_info_warning": "데이터 부족 안내 (충분하면 null)"
+}}
+"""
+
+
+# ──────────────────────────────────────────────
+# HTML 파서
+# ──────────────────────────────────────────────
+class _TextExtractor(HTMLParser):
+    SKIP_TAGS = {"script", "style", "noscript", "meta", "link", "head"}
+
+    def __init__(self, base_url: str = ""):
+        super().__init__()
+        self._skip_depth = 0
+        self._parts: list = []
+        self._links: list = []
+        self._base_url = base_url
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self.SKIP_TAGS:
+            self._skip_depth += 1
+        if tag.lower() == "a":
+            href = dict(attrs).get("href", "")
+            if href:
+                full = urllib.parse.urljoin(self._base_url, href)
+                self._links.append(full)
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self.SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            s = data.strip()
+            if s:
+                self._parts.append(s)
+
+    def get_text(self) -> str:
+        return "\n".join(self._parts)
+
+    def get_links(self) -> list:
+        return self._links
+
+
+def _is_spa(html: str) -> bool:
+    visible_text_len = len(re.sub(r"<[^>]+>", " ", html).strip())
+    script_count = html.lower().count("<script")
+    return visible_text_len < 2000 and script_count >= 2
+
+
+# ──────────────────────────────────────────────
+# 크롤링 유틸
+# ──────────────────────────────────────────────
+def _fetch_bytes(url: str):
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CareerBot/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read()
+    except Exception as e:
+        print(f"    ⚠ 다운로드 실패 [{url}]: {e}")
+        return None
+
+
+def _parse_pdf_bytes(data: bytes) -> str:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        text = "\n".join(pages)
+        print(f"    ✔ PDF 파싱 완료 ({len(reader.pages)}페이지, {len(text)}자)")
+        return text
+    except Exception as e:
+        print(f"    ⚠ PDF 파싱 오류: {e}")
+        return ""
+
+
+def _parse_html_bytes(data: bytes, url: str):
+    try:
+        html = data.decode("utf-8")
+    except UnicodeDecodeError:
+        html = data.decode("euc-kr", errors="replace")
+    parser = _TextExtractor(base_url=url)
+    parser.feed(html)
+    return parser.get_text(), parser.get_links(), html
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    return urllib.parse.urlparse(url_a).netloc == urllib.parse.urlparse(url_b).netloc
+
+
+# ──────────────────────────────────────────────
+# 스마트 크롤러
+# ──────────────────────────────────────────────
+def fetch_url(base_url: str) -> str:
+    print(f"  🌐 크롤링 시작: {base_url}")
+    collected = []
+    visited = set()
+
+    raw = _fetch_bytes(base_url)
+    if raw is None:
+        return ""
+
+    if base_url.lower().endswith(".pdf") or (raw and raw[:4] == b"%PDF"):
+        text = _parse_pdf_bytes(raw)
+        if text:
+            collected.append(f"[PDF: {base_url}]\n{text}")
+        result = "\n\n".join(collected)
+        print(f"  ✔ 최종 수집 텍스트: {len(result)}자")
+        return result
+
+    html_text, links, raw_html = _parse_html_bytes(raw, base_url)
+    visited.add(base_url)
+
+    spa_detected = _is_spa(raw_html)
+    if html_text.strip():
+        collected.append(f"[메인 페이지]\n{html_text}")
+        print(f"    → 메인 HTML 텍스트: {len(html_text)}자")
+
+    if spa_detected:
+        print("    ⚡ SPA 감지 — 하위 페이지·PDF 자동 탐색 시작")
+    else:
+        print("    ℹ 일반 HTML — 링크 내 PDF·서브페이지 탐색")
+
+    to_visit = []
+    seen = set()
+    for lnk in links:
+        clean = lnk.split("#")[0]
+        if (
+            clean
+            and clean not in seen
+            and clean not in visited
+            and _same_origin(base_url, clean)
+            and not clean.startswith("mailto:")
+        ):
+            seen.add(clean)
+            to_visit.append(clean)
+
+    print(f"    → 같은 도메인 링크 {len(to_visit)}개 발견")
+
+    for lnk in to_visit[:20]:
+        if lnk in visited:
+            continue
+        visited.add(lnk)
+
+        sub_raw = _fetch_bytes(lnk)
+        if sub_raw is None:
+            continue
+
+        is_pdf = lnk.lower().endswith(".pdf") or sub_raw[:4] == b"%PDF"
+        if is_pdf:
+            print(f"    📄 PDF 발견: {lnk}")
+            pdf_text = _parse_pdf_bytes(sub_raw)
+            if pdf_text.strip():
+                collected.append(f"[PDF: {lnk}]\n{pdf_text}")
+        else:
+            sub_text, sub_links, _ = _parse_html_bytes(sub_raw, lnk)
+            if sub_text.strip():
+                print(f"    📃 서브페이지: {lnk} ({len(sub_text)}자)")
+                collected.append(f"[서브페이지: {lnk}]\n{sub_text}")
+            for sl in sub_links:
+                sl_clean = sl.split("#")[0]
+                if (
+                    sl_clean.lower().endswith(".pdf")
+                    and sl_clean not in visited
+                    and _same_origin(base_url, sl_clean)
+                ):
+                    visited.add(sl_clean)
+                    print(f"    📄 PDF 발견 (서브): {sl_clean}")
+                    pdf_raw = _fetch_bytes(sl_clean)
+                    if pdf_raw:
+                        pdf_text = _parse_pdf_bytes(pdf_raw)
+                        if pdf_text.strip():
+                            collected.append(f"[PDF: {sl_clean}]\n{pdf_text}")
+
+    result = "\n\n".join(collected)
+    print(f"\n  ✔ 최종 수집 텍스트: {len(result)}자 (소스 {len(collected)}개)")
+    return result
+
+
+# ──────────────────────────────────────────────
+# 파일 읽기
+# ──────────────────────────────────────────────
+def read_file(path: str) -> str:
+    if not os.path.isfile(path):
+        print(f"  ❌ 파일을 찾을 수 없습니다: {path}")
+        return ""
+    if path.lower().endswith(".pdf"):
+        with open(path, "rb") as f:
+            return _parse_pdf_bytes(f.read())
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        print(f"  ✔ 파일 읽기 완료 ({len(content)}자)")
+        return content
+    except Exception as e:
+        print(f"  ❌ 파일 읽기 오류: {e}")
+        return ""
+
+
+# ──────────────────────────────────────────────
+# JSON 정제
+# ──────────────────────────────────────────────
+def clean_json_response(raw_text: str) -> str:
+    """
+    모델 응답에서 순수 JSON 객체만 추출합니다.
+    처리 패턴:
+      1) ```json ... ``` 또는 ``` ... ``` 코드블록
+      2) 앞뒤 설명 텍스트 + { ... }
+      3) google_search grounding 메타데이터 혼입
+      4) JSON 뒤 부연 설명
+    """
+    raw_text = raw_text.strip()
+
+    # 패턴 1: 마크다운 코드블록 안의 JSON 우선 추출
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw_text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 패턴 2: 코드블록 없으면 { } 범위 직접 추출
+    start = raw_text.find("{")
+    end   = raw_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return raw_text[start:end + 1].strip()
+
+    # 패턴 3: 그래도 없으면 원문 그대로 반환 (오류 메시지 보존)
+    return raw_text
+
+
+# ──────────────────────────────────────────────
+# ✅ 임베딩 — 새 SDK 방식
+# ──────────────────────────────────────────────
+def get_embedding(text: str):
+    if not text:
+        return None
+    try:
+        result = client.models.embed_content(
+            model=_EMBEDDING_MODEL,
+            contents=text[:10000],
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_DOCUMENT"
+            ),
+        )
+        vector = result.embeddings[0].values
+        print(f"  (임베딩 모델: {_EMBEDDING_MODEL})")
+        return vector
+    except Exception as e:
+        print(f"  ⚠ 임베딩 실패: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────
+# ✅ 채용공고 날짜 유효성 검증 (클라이언트 2차 검증)
+# ──────────────────────────────────────────────
+def filter_valid_jobs(jobs: list, ref_date: date) -> tuple:
+    """
+    모델이 반환한 공고를 날짜 기준으로 한 번 더 검증합니다.
+    반환: (유효 공고 리스트, 만료 공고 리스트)
+    """
+    valid, expired = [], []
+    for job in jobs:
+        deadline_str = job.get("deadline", "")
+        # '상시채용' 또는 날짜 파싱 불가 → 유효로 간주
+        if not deadline_str or deadline_str in ("상시채용", "없음", "미정", "-"):
+            job["is_valid"] = True
+            valid.append(job)
+            continue
+        try:
+            deadline = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+            if deadline >= ref_date:
+                job["is_valid"] = True
+                valid.append(job)
+            else:
+                job["is_valid"] = False
+                expired.append(job)
+        except ValueError:
+            # 날짜 형식 불일치 → 유효로 간주
+            job["is_valid"] = True
+            valid.append(job)
+    return valid, expired
+
+
+# ──────────────────────────────────────────────
+# ✅ 커리어 분석 — 새 SDK 방식
+# ──────────────────────────────────────────────
+def analyze_career_pro(user_text: str, ref_date: date) -> dict:
+    system_prompt = build_system_prompt(ref_date)
+    prompt = (
+        f"다음 사용자 데이터를 바탕으로 커리어 분석을 수행하고, "
+        f"{ref_date.strftime('%Y-%m-%d')} 이후 마감인 유효한 채용공고를 "
+        f"Google Search로 검색하여 추천하세요:\n\n{user_text}"
+    )
+
+    raw_text = ""
+    try:
+        # ✅ 새 SDK: client.models.generate_content + google_search 도구
+        response = client.models.generate_content(
+            model=_ANALYSIS_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.3,
+            ),
+        )
+        raw_text = response.text.strip()
+        cleaned = clean_json_response(raw_text)
+        return json.loads(cleaned)
+
+    except json.JSONDecodeError as e:
+        return {
+            "status": "error",
+            "message": f"JSON 파싱 실패 (위치: 줄 {e.lineno}, 컬럼 {e.colno}) — {e.msg}",
+            "raw_response": raw_text or "응답 없음",   # 전체 저장 (출력은 500자 제한)
+        }
+    except Exception as e:
+        # google_search 도구 미지원 환경 fallback
+        try:
+            response = client.models.generate_content(
+                model=_ANALYSIS_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.3,
+                ),
+            )
+            raw_text = response.text.strip()
+            cleaned = clean_json_response(raw_text)
+            return json.loads(cleaned)
+        except Exception as e2:
+            return {"status": "error", "message": str(e2)}
+
+
+# ──────────────────────────────────────────────
+# 사용자 입력
+# ──────────────────────────────────────────────
+def get_user_input() -> str:
+    print("\n[입력 방식]")
+    print("  1: URL 크롤링  (SPA·PDF 자동 탐색)")
+    print("  2: 파일 경로   (.txt / .pdf 지원)")
+    print("  3: 텍스트 직접 입력")
+    mode = input("선택 (기본값: 3): ").strip() or "3"
+
+    if mode == "1":
+        url = input("URL을 입력하세요: ").strip()
+        if not url.startswith("http"):
+            url = "https://" + url
+        content = fetch_url(url)
+        if not content:
+            print("  ⚠ 크롤링 실패 — 텍스트를 직접 입력해 주세요.")
+            mode = "3"
+        else:
+            return content
+
+    if mode == "2":
+        path = input("파일 경로를 입력하세요: ").strip()
+        content = read_file(path)
+        if not content:
+            print("  ⚠ 파일 읽기 실패 — 텍스트를 직접 입력해 주세요.")
+            mode = "3"
+        else:
+            return content
+
+    print("\n자신의 경력, 활동, 배운 점 등을 상세히 입력하세요.")
+    print("(입력을 마치려면 빈 줄에서 'END'를 입력하세요)\n")
+    lines = []
+    while True:
+        line = input()
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
+# 결과 출력
+# ──────────────────────────────────────────────
+def print_results(result: dict, ref_date: date) -> None:
+    status = result.get("status")
+
+    if status == "error":
+        print("\n❌ 분석 중 오류 발생:")
+        print(f"  원인: {result.get('message')}")
+        raw = result.get("raw_response", "")
+        if raw:
+            print(f"\n  [원본 응답 일부]\n  {raw[:500]}")
+        return
+
+    if status == "insufficient_data":
+        print("\n⚠ [데이터 부족 알림]")
+        print(result.get("missing_info_warning", "입력 데이터가 부족합니다."))
+        return
+
+    print(f"\n▶ 한 줄 요약: {result.get('brief_summary', '-')}\n")
+
+    print("-" * 20 + " [심층 분석 요약] " + "-" * 20)
+    print(result.get("detailed_summary", "-"))
+
+    clusters = result.get("keyword_clustering", {})
+    print("\n" + "-" * 20 + " [역량 카테고리 분류] " + "-" * 20)
+    print(f"• 직군/직종: {', '.join(clusters.get('job_industry', []))}")
+    print(f"• 핵심 역량: {', '.join(clusters.get('core_competency', []))}")
+    print(f"• 성향/태도: {', '.join(clusters.get('personality_tendency', []))}")
+
+    insights = result.get("experience_insights", {})
+    if insights:
+        print("\n" + "-" * 20 + " [경험 인사이트] " + "-" * 20)
+        print(f"• 동기: {insights.get('motivation', '-')}")
+        print(f"• 성장: {insights.get('learning_points', '-')}")
+
+    print("\n" + "-" * 20 + " [STAR 방식 이력서 초안] " + "-" * 20)
+    for item in result.get("resume_star_format", []):
+        print(f"\n  제목: {item.get('title', '-')}")
+        print(f"    (S) 상황: {item.get('S', '-')}")
+        print(f"    (T) 과제: {item.get('T', '-')}")
+        print(f"    (A) 행동: {item.get('A', '-')}")
+        print(f"    (R) 결과: {item.get('R', '-')}")
+
+    # ✅ 날짜 필터 적용 후 출력
+    all_jobs = result.get("valid_job_recommendations", [])
+    valid_jobs, expired_jobs = filter_valid_jobs(all_jobs, ref_date)
+
+    print("\n" + "-" * 20 + f" [유효 채용 공고 — {ref_date} 이후 마감] " + "-" * 20)
+    if not valid_jobs:
+        print("  해당 기준일 이후 유효한 공고가 없습니다.")
+    for job in valid_jobs:
+        deadline = job.get("deadline", "-")
+        badge = "🟢 상시" if deadline in ("상시채용", "없음", "미정", "-") else f"🗓 마감 {deadline}"
+        print(f"\n• [{badge}] {job.get('company', '-')} | {job.get('role', '-')}")
+        print(f"  - 매칭 이유: {job.get('why_match', '-')}")
+        print(f"  - 공고 확인: {job.get('url', '-')}")
+
+    if expired_jobs:
+        print(f"\n" + "-" * 20 + " [⚠ 마감된 공고 — 참고용] " + "-" * 20)
+        for job in expired_jobs:
+            print(f"\n• [❌ 마감 {job.get('deadline', '-')}] {job.get('company', '-')} | {job.get('role', '-')}")
+            print(f"  - 공고 확인: {job.get('url', '-')}")
+
+    warning = result.get("missing_info_warning")
+    if warning:
+        print(f"\n⚠ 참고: {warning}")
+
+
+# ──────────────────────────────────────────────
+# 메인
+# ──────────────────────────────────────────────
+def main():
+    print("=" * 65)
+    print("  🎯 커리어 분석 AI - Professional Edition")
+    print("=" * 65)
+
+    # 1) 기준 날짜 입력
+    ref_date = get_reference_date()
+
+    # 2) 분석 대상 텍스트 입력
+    raw_content = get_user_input()
+
+    if len(raw_content.strip()) < 50:
+        print("\n⚠ 입력된 데이터가 너무 짧습니다. 50자 이상 입력해 주세요.")
+        return
+
+    # 3) 임베딩
+    print("\n[1/3] 사용자 성향 임베딩 벡터 생성 중...")
+    vector = get_embedding(raw_content)
+    if vector:
+        print(f"  ✔ 임베딩 생성 완료 (차원: {len(vector)})")
+    else:
+        print("  ⚠ 임베딩 생성 실패 (분석은 계속 진행합니다)")
+
+    # 4) 커리어 분석 + 채용공고 검색
+    print("\n[2/3] 전문 커리어 분석 및 실시간 공고 매칭 중...")
+    analysis_result = analyze_career_pro(raw_content, ref_date)
+
+    # 5) 결과 출력
+    print("\n[3/3] 분석 완료!\n")
+    print_results(analysis_result, ref_date)
+
+
+if __name__ == "__main__":
+    main()
