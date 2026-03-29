@@ -1,12 +1,17 @@
 """
-커리어 분석 AI - Professional Edition
+커리어 분석 AI - Professional Edition v2
 --------------------------------------
 변경사항:
-  - google-generativeai → google-genai (신규 공식 SDK)
+  - 분석 모드 선택 기능 추가:
+      [A] 종합 분석: 복합적 커리어 전체 분석 + 채용공고 추천 (기존 기능)
+      [B] 개별 활동 분석: 단일 경력/자격증/활동 심층 분석 + 시너지 추천
+  - google-genai (신규 공식 SDK)
   - 임베딩 모델: gemini-embedding-001 (2026년 최신)
   - 채용공고 날짜 필터: 사용자가 입력한 마감일 기준으로 유효 공고만 표시
   - URL 크롤링: SPA 감지 + PDF 자동 추출 유지
 """
+
+!pip install pypdf
 
 import json
 import re
@@ -17,7 +22,6 @@ import urllib.parse
 from html.parser import HTMLParser
 from datetime import datetime, date
 
-# ✅ 신규 공식 SDK
 from google import genai
 from google.genai import types
 
@@ -26,23 +30,47 @@ import pypdf
 # ──────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyDL3Md4U3rctgjwuASn3mCUFCijLZWGpV0"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ✅ 새 SDK: configure() 대신 Client() 사용
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 _ANALYSIS_MODEL  = "gemini-2.5-flash"
-_EMBEDDING_MODEL = "gemini-embedding-001"   # ✅ 2026년 기준 최신 임베딩 모델
+_EMBEDDING_MODEL = "gemini-embedding-001"
 
 
-# ──────────────────────────────────────────────
-# 날짜 입력 유틸
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ① 분석 모드 선택
+# ══════════════════════════════════════════════
+def select_analysis_mode() -> str:
+    """
+    사용자에게 분석 모드를 선택받습니다.
+    반환값: "A" (종합 분석) | "B" (개별 활동 분석)
+    """
+    print("\n" + "=" * 65)
+    print("  📌 분석 모드를 선택하세요")
+    print("=" * 65)
+    print()
+    print("  [A] 종합 커리어 분석")
+    print("      → 여러 경력·활동·자격증을 종합적으로 분석합니다.")
+    print("      → 역량 클러스터링, STAR 이력서 초안, 채용공고 추천 포함")
+    print()
+    print("  [B] 개별 활동 심층 분석")
+    print("      → 단일 경력/자격증/활동 하나를 집중 분석합니다.")
+    print("      → 해당 활동의 의미·강점·한계와 함께,")
+    print("         시너지를 낼 수 있는 추천 자격증·활동을 제안합니다.")
+    print()
+
+    while True:
+        choice = input("  선택 입력 (A 또는 B, 기본값: A): ").strip().upper() or "A"
+        if choice in ("A", "B"):
+            return choice
+        print("  ⚠ A 또는 B를 입력해 주세요.")
+
+
+# ══════════════════════════════════════════════
+# ② 날짜 입력 유틸 (종합 분석 전용)
+# ══════════════════════════════════════════════
 def get_reference_date() -> date:
-    """
-    사용자가 기준일을 입력하면 그 날짜를 반환합니다.
-    엔터를 누르면 오늘 날짜를 사용합니다.
-    """
     today_str = datetime.now().strftime("%Y-%m-%d")
     print(f"\n[채용공고 마감일 기준]")
     print(f"  입력한 날짜 이후에 마감되는 공고만 유효한 공고로 표시합니다.")
@@ -62,10 +90,12 @@ def get_reference_date() -> date:
         return date.today()
 
 
-# ──────────────────────────────────────────────
-# 시스템 프롬프트 (기준일 동적 주입)
-# ──────────────────────────────────────────────
-def build_system_prompt(ref_date: date) -> str:
+# ══════════════════════════════════════════════
+# ③ 시스템 프롬프트
+# ══════════════════════════════════════════════
+
+# ── ③-A. 종합 분석 프롬프트 (기존) ──
+def build_system_prompt_comprehensive(ref_date: date) -> str:
     return f"""
 당신은 대한민국 최고의 전문 커리어 컨설턴트이자 데이터 분석가입니다.
 분석 기준일: {ref_date.strftime('%Y-%m-%d')}
@@ -73,8 +103,9 @@ def build_system_prompt(ref_date: date) -> str:
 [분석 원칙]
 1. 근거 중심: 제공된 텍스트에 명시된 사실에만 기반하여 분석하십시오.
 2. 환각 방지: 데이터가 부족하면 'status'를 'insufficient_data'로 설정하십시오.
-3. STAR 방식: 이력서 초안은 STAR 프레임워크를 따르십시오.
-4. 채용공고 유효성: 반드시 마감일이 {ref_date.strftime('%Y-%m-%d')} 이후인 공고만 추천하십시오.
+3. 개별 데이터 분석: 개별 항목이나 자격증 등에 대한 분석을 유저가 원하면 해당 자격증이나 커리어에 대한 심층적 분석, 다른 활동과의 연계 가능성을 분석해 출력하십시오.
+4. STAR 방식: 이력서 초안은 STAR 프레임워크를 따르십시오.
+5. 채용공고 유효성: 반드시 마감일이 {ref_date.strftime('%Y-%m-%d')} 이후인 공고만 추천하십시오.
    - 마감일을 확인할 수 없는 공고는 추천하지 마십시오.
    - 각 공고의 마감일(deadline)을 반드시 응답에 포함하십시오.
    - Google Search를 사용해 실시간으로 공고를 검색하십시오.
@@ -120,9 +151,68 @@ def build_system_prompt(ref_date: date) -> str:
 """
 
 
-# ──────────────────────────────────────────────
-# HTML 파서
-# ──────────────────────────────────────────────
+# ── ③-B. 개별 활동 분석 프롬프트 (신규) ──
+def build_system_prompt_individual() -> str:
+    return """
+당신은 대한민국 최고의 전문 커리어 컨설턴트입니다.
+사용자가 제공한 단일 경력·자격증·활동 하나를 심층 분석하는 것이 당신의 임무입니다.
+
+[분석 원칙]
+1. 단일 집중: 입력된 하나의 항목에만 집중하여 분석하십시오.
+2. 근거 중심: 제공된 텍스트에 명시된 사실에만 기반하십시오.
+3. 실질적 가치: 해당 활동이 커리어에서 갖는 의미를 구체적으로 서술하십시오.
+4. 시너지 발굴: 해당 활동과 연계하면 더 큰 효력을 낼 수 있는
+   자격증·교육·활동·프로젝트를 우선순위에 따라 추천하십시오.
+   각 추천 항목에는 반드시 연계 이유와 기대 효과를 포함하십시오.
+5. 환각 방지: 데이터가 부족하면 'status'를 'insufficient_data'로 설정하십시오.
+
+[출력 형식 - 중요]
+응답은 반드시 JSON 형태로 출력하십시오. 다른 부연 설명 없이 오직 순수한 JSON 중괄호 {} 로만 시작하고 끝나야 합니다.
+
+[출력 데이터 구조]
+{
+    "status": "success" | "insufficient_data",
+    "item_name": "분석 대상 활동/자격증/경력명",
+    "item_type": "자격증" | "직무경력" | "프로젝트" | "교육" | "봉사·대외활동" | "수상" | "기타",
+    "brief_summary": "해당 항목의 핵심 한 줄 요약",
+    "deep_analysis": {
+        "career_value": "커리어 측면에서의 구체적 가치와 의미",
+        "strengths": ["강점 1", "강점 2", "강점 3"],
+        "limitations": ["한계 또는 보완 필요 사항 1", "한계 또는 보완 필요 사항 2"],
+        "applicable_roles": ["이 활동이 어필될 수 있는 직무/직군"],
+        "market_value": "현재 노동시장에서의 해당 역량 수요 평가"
+    },
+    "star_format": {
+        "title": "경험 명칭",
+        "S": "상황 (Situation)",
+        "T": "과제 (Task)",
+        "A": "행동 (Action)",
+        "R": "결과 (Result)"
+    },
+    "synergy_recommendations": [
+        {
+            "priority": 1,
+            "category": "자격증" | "교육·강의" | "프로젝트" | "대외활동" | "경험",
+            "name": "추천 자격증/활동/경험명",
+            "reason": "현재 활동과의 연계 이유",
+            "expected_effect": "함께 보유했을 때의 기대 효과",
+            "difficulty": "취득/참여 난이도 (하/중/상)",
+            "estimated_duration": "소요 예상 기간 (예: 1~3개월)"
+        }
+    ],
+    "action_plan": {
+        "단기" : "(3개월 이내) 권장 액션",
+        "중기" : "(6개월~1년) 권장 액션",
+        "장기" : "(1년 이상) 권장 액션"
+    },
+    "missing_info_warning": "데이터 부족 안내 (충분하면 null)"
+}
+"""
+
+
+# ══════════════════════════════════════════════
+# ④ HTML 파서
+# ══════════════════════════════════════════════
 class _TextExtractor(HTMLParser):
     SKIP_TAGS = {"script", "style", "noscript", "meta", "link", "head"}
 
@@ -165,9 +255,9 @@ def _is_spa(html: str) -> bool:
     return visible_text_len < 2000 and script_count >= 2
 
 
-# ──────────────────────────────────────────────
-# 크롤링 유틸
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ⑤ 크롤링 유틸
+# ══════════════════════════════════════════════
 def _fetch_bytes(url: str):
     try:
         req = urllib.request.Request(
@@ -207,9 +297,6 @@ def _same_origin(url_a: str, url_b: str) -> bool:
     return urllib.parse.urlparse(url_a).netloc == urllib.parse.urlparse(url_b).netloc
 
 
-# ──────────────────────────────────────────────
-# 스마트 크롤러
-# ──────────────────────────────────────────────
 def fetch_url(base_url: str) -> str:
     print(f"  🌐 크롤링 시작: {base_url}")
     collected = []
@@ -296,9 +383,9 @@ def fetch_url(base_url: str) -> str:
     return result
 
 
-# ──────────────────────────────────────────────
-# 파일 읽기
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ⑥ 파일 읽기
+# ══════════════════════════════════════════════
 def read_file(path: str) -> str:
     if not os.path.isfile(path):
         print(f"  ❌ 파일을 찾을 수 없습니다: {path}")
@@ -316,38 +403,27 @@ def read_file(path: str) -> str:
         return ""
 
 
-# ──────────────────────────────────────────────
-# JSON 정제
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ⑦ JSON 정제
+# ══════════════════════════════════════════════
 def clean_json_response(raw_text: str) -> str:
-    """
-    모델 응답에서 순수 JSON 객체만 추출합니다.
-    처리 패턴:
-      1) ```json ... ``` 또는 ``` ... ``` 코드블록
-      2) 앞뒤 설명 텍스트 + { ... }
-      3) google_search grounding 메타데이터 혼입
-      4) JSON 뒤 부연 설명
-    """
     raw_text = raw_text.strip()
 
-    # 패턴 1: 마크다운 코드블록 안의 JSON 우선 추출
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw_text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
 
-    # 패턴 2: 코드블록 없으면 { } 범위 직접 추출
     start = raw_text.find("{")
     end   = raw_text.rfind("}")
     if start != -1 and end != -1 and end > start:
         return raw_text[start:end + 1].strip()
 
-    # 패턴 3: 그래도 없으면 원문 그대로 반환 (오류 메시지 보존)
     return raw_text
 
 
-# ──────────────────────────────────────────────
-# ✅ 임베딩 — 새 SDK 방식
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ⑧ 임베딩
+# ══════════════════════════════════════════════
 def get_embedding(text: str):
     if not text:
         return None
@@ -355,9 +431,7 @@ def get_embedding(text: str):
         result = client.models.embed_content(
             model=_EMBEDDING_MODEL,
             contents=text[:10000],
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT"
-            ),
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
         )
         vector = result.embeddings[0].values
         print(f"  (임베딩 모델: {_EMBEDDING_MODEL})")
@@ -367,18 +441,88 @@ def get_embedding(text: str):
         return None
 
 
-# ──────────────────────────────────────────────
-# ✅ 채용공고 날짜 유효성 검증 (클라이언트 2차 검증)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# ⑨ 공통 LLM 호출 함수
+# ══════════════════════════════════════════════
+def _call_model(system_prompt: str, user_prompt: str, use_google_search: bool = False) -> dict:
+    raw_text = ""
+    try:
+        config_kwargs = dict(
+            system_instruction=system_prompt,
+            temperature=0.3,
+        )
+        if use_google_search:
+            config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+        response = client.models.generate_content(
+            model=_ANALYSIS_MODEL,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        raw_text = response.text.strip()
+        cleaned = clean_json_response(raw_text)
+        return json.loads(cleaned)
+
+    except json.JSONDecodeError as e:
+        return {
+            "status": "error",
+            "message": f"JSON 파싱 실패 (위치: 줄 {e.lineno}, 컬럼 {e.colno}) — {e.msg}",
+            "raw_response": raw_text or "응답 없음",
+        }
+    except Exception as e:
+        # google_search 미지원 환경 fallback
+        if use_google_search:
+            try:
+                response = client.models.generate_content(
+                    model=_ANALYSIS_MODEL,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        temperature=0.3,
+                    ),
+                )
+                raw_text = response.text.strip()
+                cleaned = clean_json_response(raw_text)
+                return json.loads(cleaned)
+            except Exception as e2:
+                return {"status": "error", "message": str(e2)}
+        return {"status": "error", "message": str(e)}
+
+
+# ══════════════════════════════════════════════
+# ⑩ 분석 함수
+# ══════════════════════════════════════════════
+
+# ── ⑩-A. 종합 분석 (기존) ──
+def analyze_career_comprehensive(user_text: str, ref_date: date) -> dict:
+    system_prompt = build_system_prompt_comprehensive(ref_date)
+    user_prompt = (
+        f"다음 사용자 데이터를 바탕으로 커리어 분석을 수행하고, "
+        f"{ref_date.strftime('%Y-%m-%d')} 이후 마감인 유효한 채용공고를 "
+        f"Google Search로 검색하여 추천하세요:\n\n{user_text}"
+    )
+    return _call_model(system_prompt, user_prompt, use_google_search=True)
+
+
+# ── ⑩-B. 개별 활동 분석 (신규) ──
+def analyze_career_individual(item_text: str) -> dict:
+    system_prompt = build_system_prompt_individual()
+    user_prompt = (
+        "다음에 제시된 단일 경력/자격증/활동을 심층 분석하고, "
+        "시너지를 낼 수 있는 자격증·활동·경험을 우선순위에 따라 추천하세요:\n\n"
+        f"{item_text}"
+    )
+    # 개별 분석은 채용공고 검색 불필요 → google_search 미사용
+    return _call_model(system_prompt, user_prompt, use_google_search=False)
+
+
+# ══════════════════════════════════════════════
+# ⑪ 채용공고 날짜 유효성 검증 (종합 분석 전용)
+# ══════════════════════════════════════════════
 def filter_valid_jobs(jobs: list, ref_date: date) -> tuple:
-    """
-    모델이 반환한 공고를 날짜 기준으로 한 번 더 검증합니다.
-    반환: (유효 공고 리스트, 만료 공고 리스트)
-    """
     valid, expired = [], []
     for job in jobs:
         deadline_str = job.get("deadline", "")
-        # '상시채용' 또는 날짜 파싱 불가 → 유효로 간주
         if not deadline_str or deadline_str in ("상시채용", "없음", "미정", "-"):
             job["is_valid"] = True
             valid.append(job)
@@ -392,68 +536,16 @@ def filter_valid_jobs(jobs: list, ref_date: date) -> tuple:
                 job["is_valid"] = False
                 expired.append(job)
         except ValueError:
-            # 날짜 형식 불일치 → 유효로 간주
             job["is_valid"] = True
             valid.append(job)
     return valid, expired
 
 
-# ──────────────────────────────────────────────
-# ✅ 커리어 분석 — 새 SDK 방식
-# ──────────────────────────────────────────────
-def analyze_career_pro(user_text: str, ref_date: date) -> dict:
-    system_prompt = build_system_prompt(ref_date)
-    prompt = (
-        f"다음 사용자 데이터를 바탕으로 커리어 분석을 수행하고, "
-        f"{ref_date.strftime('%Y-%m-%d')} 이후 마감인 유효한 채용공고를 "
-        f"Google Search로 검색하여 추천하세요:\n\n{user_text}"
-    )
-
-    raw_text = ""
-    try:
-        # ✅ 새 SDK: client.models.generate_content + google_search 도구
-        response = client.models.generate_content(
-            model=_ANALYSIS_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.3,
-            ),
-        )
-        raw_text = response.text.strip()
-        cleaned = clean_json_response(raw_text)
-        return json.loads(cleaned)
-
-    except json.JSONDecodeError as e:
-        return {
-            "status": "error",
-            "message": f"JSON 파싱 실패 (위치: 줄 {e.lineno}, 컬럼 {e.colno}) — {e.msg}",
-            "raw_response": raw_text or "응답 없음",   # 전체 저장 (출력은 500자 제한)
-        }
-    except Exception as e:
-        # google_search 도구 미지원 환경 fallback
-        try:
-            response = client.models.generate_content(
-                model=_ANALYSIS_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.3,
-                ),
-            )
-            raw_text = response.text.strip()
-            cleaned = clean_json_response(raw_text)
-            return json.loads(cleaned)
-        except Exception as e2:
-            return {"status": "error", "message": str(e2)}
-
-
-# ──────────────────────────────────────────────
-# 사용자 입력
-# ──────────────────────────────────────────────
-def get_user_input() -> str:
-    print("\n[입력 방식]")
+# ══════════════════════════════════════════════
+# ⑫ 사용자 입력
+# ══════════════════════════════════════════════
+def get_user_input(mode_label: str = "") -> str:
+    print(f"\n[입력 방식{' — ' + mode_label if mode_label else ''}]")
     print("  1: URL 크롤링  (SPA·PDF 자동 탐색)")
     print("  2: 파일 경로   (.txt / .pdf 지원)")
     print("  3: 텍스트 직접 입력")
@@ -479,8 +571,7 @@ def get_user_input() -> str:
         else:
             return content
 
-    print("\n자신의 경력, 활동, 배운 점 등을 상세히 입력하세요.")
-    print("(입력을 마치려면 빈 줄에서 'END'를 입력하세요)\n")
+    print("\n입력을 마치려면 빈 줄에서 'END'를 입력하세요.\n")
     lines = []
     while True:
         line = input()
@@ -490,10 +581,12 @@ def get_user_input() -> str:
     return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────
-# 결과 출력
-# ──────────────────────────────────────────────
-def print_results(result: dict, ref_date: date) -> None:
+# ══════════════════════════════════════════════
+# ⑬ 결과 출력
+# ══════════════════════════════════════════════
+
+# ── ⑬-A. 종합 분석 결과 출력 (기존) ──
+def print_results_comprehensive(result: dict, ref_date: date) -> None:
     status = result.get("status")
 
     if status == "error":
@@ -534,7 +627,6 @@ def print_results(result: dict, ref_date: date) -> None:
         print(f"    (A) 행동: {item.get('A', '-')}")
         print(f"    (R) 결과: {item.get('R', '-')}")
 
-    # ✅ 날짜 필터 적용 후 출력
     all_jobs = result.get("valid_job_recommendations", [])
     valid_jobs, expired_jobs = filter_valid_jobs(all_jobs, ref_date)
 
@@ -559,39 +651,169 @@ def print_results(result: dict, ref_date: date) -> None:
         print(f"\n⚠ 참고: {warning}")
 
 
-# ──────────────────────────────────────────────
-# 메인
-# ──────────────────────────────────────────────
-def main():
-    print("=" * 65)
-    print("  🎯 커리어 분석 AI - Professional Edition")
-    print("=" * 65)
+# ── ⑬-B. 개별 활동 분석 결과 출력 (신규) ──
+def print_results_individual(result: dict) -> None:
+    status = result.get("status")
 
-    # 1) 기준 날짜 입력
-    ref_date = get_reference_date()
-
-    # 2) 분석 대상 텍스트 입력
-    raw_content = get_user_input()
-
-    if len(raw_content.strip()) < 50:
-        print("\n⚠ 입력된 데이터가 너무 짧습니다. 50자 이상 입력해 주세요.")
+    if status == "error":
+        print("\n❌ 분석 중 오류 발생:")
+        print(f"  원인: {result.get('message')}")
+        raw = result.get("raw_response", "")
+        if raw:
+            print(f"\n  [원본 응답 일부]\n  {raw[:500]}")
         return
 
-    # 3) 임베딩
-    print("\n[1/3] 사용자 성향 임베딩 벡터 생성 중...")
-    vector = get_embedding(raw_content)
-    if vector:
-        print(f"  ✔ 임베딩 생성 완료 (차원: {len(vector)})")
+    if status == "insufficient_data":
+        print("\n⚠ [데이터 부족 알림]")
+        print(result.get("missing_info_warning", "입력 데이터가 부족합니다."))
+        return
+
+    item_name = result.get("item_name", "-")
+    item_type = result.get("item_type", "-")
+    print(f"\n▶ 분석 대상: [{item_type}] {item_name}")
+    print(f"▶ 한 줄 요약: {result.get('brief_summary', '-')}\n")
+
+    # 심층 분석
+    deep = result.get("deep_analysis", {})
+    print("=" * 60)
+    print("  📊 심층 분석")
+    print("=" * 60)
+    print(f"\n  💡 커리어 가치\n  {deep.get('career_value', '-')}")
+
+    strengths = deep.get("strengths", [])
+    if strengths:
+        print(f"\n  ✅ 강점")
+        for s in strengths:
+            print(f"    • {s}")
+
+    limitations = deep.get("limitations", [])
+    if limitations:
+        print(f"\n  ⚠ 보완 필요 사항")
+        for l in limitations:
+            print(f"    • {l}")
+
+    roles = deep.get("applicable_roles", [])
+    if roles:
+        print(f"\n  🎯 어필 가능한 직무/직군")
+        print(f"    {', '.join(roles)}")
+
+    print(f"\n  📈 노동시장 수요 평가\n  {deep.get('market_value', '-')}")
+
+    # STAR 초안
+    star = result.get("star_format", {})
+    if star:
+        print("\n" + "=" * 60)
+        print("  📝 STAR 방식 이력서 초안")
+        print("=" * 60)
+        print(f"\n  제목: {star.get('title', '-')}")
+        print(f"  (S) 상황: {star.get('S', '-')}")
+        print(f"  (T) 과제: {star.get('T', '-')}")
+        print(f"  (A) 행동: {star.get('A', '-')}")
+        print(f"  (R) 결과: {star.get('R', '-')}")
+
+    # 시너지 추천
+    synergies = result.get("synergy_recommendations", [])
+    if synergies:
+        print("\n" + "=" * 60)
+        print("  🔗 시너지 추천 — 함께 갖추면 효과적인 자격증·활동")
+        print("=" * 60)
+        for rec in synergies:
+            priority  = rec.get("priority", "-")
+            category  = rec.get("category", "-")
+            name      = rec.get("name", "-")
+            reason    = rec.get("reason", "-")
+            effect    = rec.get("expected_effect", "-")
+            diff      = rec.get("difficulty", "-")
+            duration  = rec.get("estimated_duration", "-")
+            print(f"\n  [{priority}위] [{category}] {name}")
+            print(f"    • 연계 이유: {reason}")
+            print(f"    • 기대 효과: {effect}")
+            print(f"    • 난이도: {diff}   |   소요 기간: {duration}")
+
+    # 액션플랜
+    action_plan = result.get("action_plan", [])
+    if action_plan:
+        print("\n" + "=" * 60)
+        print("  🗺 액션 플랜")
+        print("=" * 60)
+        labels = ["📌 단기 (3개월 이내)", "📅 중기 (6개월~1년)", "🚀 장기 (1년 이상)"]
+        for i, action in enumerate(action_plan):
+            label = labels[i] if i < len(labels) else f"  {i+1}단계"
+            print(f"\n  {label}")
+            print(f"    → {action}")
+
+    warning = result.get("missing_info_warning")
+    if warning:
+        print(f"\n⚠ 참고: {warning}")
+
+
+# ══════════════════════════════════════════════
+# ⑭ 메인
+# ══════════════════════════════════════════════
+def main():
+    print("=" * 65)
+    print("  🎯 커리어 분석 AI - Professional Edition v2")
+    print("=" * 65)
+
+    # 1) 분석 모드 선택
+    mode = select_analysis_mode()
+
+    # ── 모드 A: 종합 분석 ──
+    if mode == "A":
+        print("\n✅ 종합 커리어 분석 모드가 선택되었습니다.")
+
+        # 기준 날짜 입력
+        ref_date = get_reference_date()
+
+        # 분석 대상 텍스트 입력
+        print("\n자신의 경력, 활동, 자격증, 배운 점 등을 상세히 입력하세요.")
+        raw_content = get_user_input(mode_label="종합 분석")
+
+        if len(raw_content.strip()) < 50:
+            print("\n⚠ 입력된 데이터가 너무 짧습니다. 50자 이상 입력해 주세요.")
+            return
+
+        # 임베딩
+        print("\n[1/3] 사용자 성향 임베딩 벡터 생성 중...")
+        vector = get_embedding(raw_content)
+        if vector:
+            print(f"  ✔ 임베딩 생성 완료 (차원: {len(vector)})")
+        else:
+            print("  ⚠ 임베딩 생성 실패 (분석은 계속 진행합니다)")
+
+        # 종합 커리어 분석
+        print("\n[2/3] 전문 커리어 분석 및 실시간 공고 매칭 중...")
+        result = analyze_career_comprehensive(raw_content, ref_date)
+
+        print("\n[3/3] 분석 완료!\n")
+        print(result)
+
+    # ── 모드 B: 개별 활동 분석 ──
     else:
-        print("  ⚠ 임베딩 생성 실패 (분석은 계속 진행합니다)")
+        print("\n✅ 개별 활동 심층 분석 모드가 선택되었습니다.")
+        print("\n분석하고 싶은 단일 경력·자격증·활동 하나를 입력하세요.")
+        print("(예: '정보처리기사 자격증', '스타트업 마케팅 인턴 6개월', '교내 창업 동아리 운영' 등)\n")
 
-    # 4) 커리어 분석 + 채용공고 검색
-    print("\n[2/3] 전문 커리어 분석 및 실시간 공고 매칭 중...")
-    analysis_result = analyze_career_pro(raw_content, ref_date)
+        raw_content = get_user_input(mode_label="개별 활동 분석")
 
-    # 5) 결과 출력
-    print("\n[3/3] 분석 완료!\n")
-    print_results(analysis_result, ref_date)
+        if len(raw_content.strip()) < 10:
+            print("\n⚠ 입력된 데이터가 너무 짧습니다. 활동 내용을 더 상세히 입력해 주세요.")
+            return
+
+        # 임베딩
+        print("\n[1/2] 활동 임베딩 벡터 생성 중...")
+        vector = get_embedding(raw_content)
+        if vector:
+            print(f"  ✔ 임베딩 생성 완료 (차원: {len(vector)})")
+        else:
+            print("  ⚠ 임베딩 생성 실패 (분석은 계속 진행합니다)")
+
+        # 개별 활동 분석
+        print("\n[2/2] 개별 활동 심층 분석 및 시너지 추천 생성 중...")
+        result = analyze_career_individual(raw_content)
+
+        print("\n✔ 분석 완료!\n")
+        print(result)
 
 
 if __name__ == "__main__":
