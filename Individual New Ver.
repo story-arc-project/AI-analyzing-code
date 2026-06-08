@@ -915,7 +915,7 @@ def main(user_input):
 
 
     # ── 최종 JSON 출력 ──
-    print(json.dumps({"vector": vector, "result": result}, ensure_ascii=False, indent=2),                                                                                                                                                                                                            "\n거제 야호~~ 미나미 화이팅!!")
+    print(json.dumps({"vector": vector, "result": result}, ensure_ascii=False, indent=2))                                                                                                                                                                                  
 
 
 
