@@ -56,7 +56,7 @@ from dataclasses import dataclass, field, asdict
 #  'GOOGLE_AI_STUDIO_API_KEY' 이름으로 등록하면 아래 resolve_api_key() 가
 #  자동으로 찾아 씁니다.
 # =============================================================================
-GOOGLE_AI_STUDIO_API_KEY = "AIzaSyCNse9OIcpRLRupNdc36fjVKxNZ1Om-AVE"          # 예: "AIza...."
+GOOGLE_AI_STUDIO_API_KEY = ""          # 예: "AIza...."
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 # 생성 파라미터: temperature 를 낮춰 환각(지어내기)을 최소화합니다. (제1원칙)
